@@ -422,14 +422,14 @@ class TestOCRFallback:
         import pytesseract
 
         data = {
-            "text": ["CT-200", "Manual", "Section"],
-            "left": [20, 80, 20],
-            "top": [30, 30, 60],
-            "width": [40, 50, 70],
-            "height": [20, 20, 20],
-            "block_num": [1, 1, 1],
-            "par_num": [1, 1, 1],
-            "line_num": [1, 1, 2],
+            "text": ["CT-200", "Manual", "First", "Section"],
+            "left": [20, 80, 20, 20],
+            "top": [30, 30, 60, 90],
+            "width": [40, 50, 40, 70],
+            "height": [31, 31, 19, 23],
+            "block_num": [1, 1, 1, 1],
+            "par_num": [1, 1, 1, 1],
+            "line_num": [1, 1, 2, 3],
         }
         monkeypatch.setenv("TESSERACT_CMD", "mock-tesseract")
         monkeypatch.setattr(parser_module.shutil, "which", lambda command: "mock-tesseract.exe")
@@ -442,10 +442,36 @@ class TestOCRFallback:
         finally:
             document.close()
 
-        assert [line.text for line in lines] == ["CT-200 Manual", "Section"]
+        assert [line.text for line in lines] == ["CT-200 Manual", "First", "Section"]
         assert all(isinstance(line, _TextLine) and line.page_number == 4 for line in lines)
-        assert lines[0].bbox == pytest.approx((10, 15, 65, 25))
-        assert lines[0].size == pytest.approx(8)
+        assert lines[0].bbox == pytest.approx((10, 15, 65, 30.5))
+        assert [line.size for line in lines] == [12, 9, 9]
+
+    def test_mocked_scanned_page_keeps_numbered_heading_hierarchy(self, tmp_path, monkeypatch):
+        import pytesseract
+
+        data = {
+            "text": ["1.", "OCR", "Section", "Recognized", "body", "text", "A", "second", "line"],
+            "left": [20, 55, 100, 20, 110, 165, 20, 40, 110],
+            "top": [30, 30, 30, 90, 90, 90, 135, 135, 135],
+            "width": [25, 35, 55, 80, 45, 35, 15, 60, 30],
+            "height": [31, 31, 31, 19, 19, 19, 23, 23, 23],
+            "block_num": [1] * 9,
+            "par_num": [1] * 9,
+            "line_num": [1, 1, 1, 2, 2, 2, 3, 3, 3],
+        }
+        monkeypatch.setenv("TESSERACT_CMD", "mock-tesseract")
+        monkeypatch.setattr(parser_module.shutil, "which", lambda command: "mock-tesseract.exe")
+        monkeypatch.setattr(pytesseract, "image_to_data", lambda image, **kwargs: data)
+
+        def draw(page):
+            page.draw_rect(fitz.Rect(30, 30, 100, 100))
+
+        nodes = parse_pdf(_make_pdf(tmp_path, draw))
+        section = next(node for node in nodes if node.heading == "1. OCR Section")
+        assert section.level == 1
+        assert "Recognized body text" in section.body
+        assert "A second line" in section.body
 
     def test_missing_tesseract_raises_clear_error(self, tmp_path, monkeypatch):
         def draw(page):

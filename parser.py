@@ -325,7 +325,7 @@ def _ocr_page_lines(page: fitz.Page, page_number: int) -> list[_TextLine]:
         lines.append(
             _TextLine(
                 text=" ".join(word[1] for word in words),
-                size=max(1.0, (bottom - top) * scale_y * 0.8),
+                size=max(1.0, round((bottom - top) * scale_y * 0.8 / 3.0) * 3.0),
                 flags=0,
                 bbox=bbox,
                 page_number=page_number,

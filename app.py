@@ -9,7 +9,7 @@ from pathlib import Path
 import fitz
 from fastapi import Body, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
-from parser import TreeNode, is_ct200_manual, load_tree, parse_pdf, save_tree, tree_to_dict
+from parser import OCRProcessingError, TreeNode, is_ct200_manual, load_tree, parse_pdf, save_tree, tree_to_dict
 from version_store import (
     _section_paths,
     compare_trees,
@@ -193,15 +193,6 @@ async def upload_version(
         with fitz.open(stream=content, filetype="pdf") as document:
             if document.page_count == 0:
                 raise HTTPException(status_code=400, detail="The PDF contains no pages.")
-            document_text = "\n".join(page.get_text("text") for page in document)
-        if not is_ct200_manual(document_text):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "This PDF does not appear to be the CardioTrack CT-200 manual. "
-                    "Expected product details plus the Device Overview and Intended Use sections."
-                ),
-            )
     except HTTPException:
         raise
     except Exception as exc:
@@ -219,12 +210,28 @@ async def upload_version(
 
     try:
         nodes = parse_pdf(pdf_path)
+    except OCRProcessingError as exc:
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         pdf_path.unlink(missing_ok=True)
         raise HTTPException(
             status_code=400,
             detail="The uploaded PDF could not be converted into document text.",
         ) from exc
+
+    parsed_text = "\n".join(
+        f"{node.heading}\n{node.body}" for node in nodes
+    )
+    if not is_ct200_manual(parsed_text):
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This PDF does not appear to be the CardioTrack CT-200 manual. "
+                "Expected product details plus the Device Overview and Intended Use sections."
+            ),
+        )
 
     try:
         save_tree(nodes, tree_path)

@@ -4,13 +4,13 @@
 
 This document describes the implementation currently in the project. It is based on [parser.py](./parser.py), [version_store.py](./version_store.py), [selection_store.py](./selection_store.py), [generation.py](./generation.py), [app.py](./app.py), [README.md](./README.md), the tests in [test_parser.py](./test_parser.py), [test_versioning.py](./test_versioning.py), and [test_part3.py](./test_part3.py). The assignment update available in [data/IMPORTANT_ASSIGNMENT_UPDATE (Read to check MD).txt](./data/IMPORTANT_ASSIGNMENT_UPDATE%20(Read%20to%20check%20MD).txt) says to work from the provided PDF rather than a Markdown file and leaves the parsing tools and approach open.
 
-The latest reported test run was 70 passed with 2 warnings using Python 3.12.10. I did not call Groq or independently rerun the suite during this documentation review, so this remains a reported result rather than a result verified while writing this document.
+After adding the OCR fallback, I ran the full suite with the project Python 3.12 environment: 78 passed with 2 dependency warnings. I also ran `verify_e2e_workflow.py`; its v1/v2 upload, comparison, pinned generation, provenance, staleness, and retrieval checks passed using a mocked provider. No external LLM request was made.
 
 ## 1. Architecture and data model
 
 The system is a local FastAPI application with three layers:
 
-1. **Parsing:** [parser.py](./parser.py) uses PyMuPDF (`fitz`) to convert PDF pages into visual text/table lines, then reconstructs a flat list representing a tree.
+1. **Parsing:** [parser.py](./parser.py) uses PyMuPDF (`fitz`) to convert PDF pages into visual text/table lines, falls back to Tesseract for pages with insufficient or damaged embedded text, then reconstructs a flat list representing a tree.
 2. **Versioning and comparison:** [version_store.py](./version_store.py) stores version metadata in SQLite and stores the original PDF and parsed tree as files. It compares nodes using stable IDs first and normalized heading paths second.
 3. **Selections, generation, and API orchestration:** [app.py](./app.py) exposes the endpoints. [selection_store.py](./selection_store.py) persists selections and generations. [generation.py](./generation.py) builds the prompt, calls the Groq-compatible endpoint, validates output, and returns provenance.
 
@@ -33,6 +33,8 @@ Selections are immutable records containing a name, source version ID, selected 
 
 For every page, `_extract_lines` reads PyMuPDF text dictionaries with whitespace preservation. Spans on a visual line are joined using their text, x coordinates, leading-space information, and a gap heuristic. The dominant character-weighted font size and combined flags are retained. Lines are sorted by page y position and x position.
 
+Before hierarchy reconstruction, the parser checks each page's extracted lines. It uses OCR if the page has fewer than 40 alphanumeric embedded-text characters or contains a Unicode replacement character, and the page has text, an image, or drawing content. Blank pages are skipped. `_ocr_page_lines` renders a page at 2× scale and calls Tesseract through `pytesseract`; Tesseract words are grouped by block, paragraph, and line into `_TextLine` objects. Their boxes are scaled back to page coordinates, and line height is used as an approximate font size. OCR lines replace the weak embedded extraction for that page, after which the existing furniture cleanup, heading detection, hierarchy reconstruction, and content hashing run unchanged. `TESSERACT_CMD` selects the executable; otherwise the parser searches `PATH` for `tesseract`.
+
 Detected tables are extracted with `page.find_tables()`. Their cells are normalized and rendered as pipe-separated rows, with a Markdown-like separator row when there is more than one column. Text lines whose centers fall inside a detected table region are removed, and the table is reinserted as one `table` line. This prevents bold table labels such as `Parameter` and `Value` from becoming false headings.
 
 ### Known irregularities and handling
@@ -47,16 +49,23 @@ Detected tables are extracted with `page.find_tables()`. Their cells are normali
 - **Paragraphs and lists:** body lines are joined with spaces within a paragraph, blank-line separators when geometry indicates a paragraph break, and newline separators for adjacent list items. Bullets include common bullet characters, hyphens/en dashes, numeric markers, and letter markers.
 - **Page furniture and interface text:** explicit browser warnings, tab labels, common menu-only labels, and repeated top/bottom edge text are filtered. The filter is intentionally conservative and does not identify arbitrary interface chrome.
 - **Duplicate headings:** occurrence counts scoped to a parent are included in the ID seed. Same text under different parents also differs because the parent ID is included.
-- **Broken or empty input:** a missing path raises `FileNotFoundError`; invalid or empty PDFs propagate a PyMuPDF error. An extractable PDF with no usable font thresholds returns only a root node. Upload handling converts malformed PDFs to a readable 400 response.
+- **OCR and empty input:** a missing path raises `FileNotFoundError`; invalid or zero-byte PDFs propagate a PyMuPDF error. A page with little or replacement-character text invokes OCR if it contains page content. Missing Tesseract, OCR execution errors, malformed OCR data, and an OCR result with no recognized text raise explicit errors rather than being treated as a successful empty extraction. The upload API returns OCR failures as HTTP 503 and removes the incomplete upload. A genuinely blank page is skipped. A PDF with no usable text after processing may still contain only a root node if no page required OCR.
 - **Manual identity:** the parser has a check requiring CardioTrack, CT-200, blood-pressure text, and both `Device Overview` and `Intended Use`. A prompt mentioning CT-200 alone is therefore rejected as an unverified manual with HTTP 422 and is not stored as a version.
 
 ## 3. Why this approach, validation, and limitations
 
-PyMuPDF was chosen because the provided manuals are PDFs with extractable text and the parser needs both text and layout metadata. A geometry-aware text-line pipeline is simpler and more deterministic than relying on page text alone, while still allowing tables and visual hierarchy to be handled explicitly. Numbering is preferred because it encodes structure directly; typography is a useful fallback when numbering is absent.
+PyMuPDF remains the primary extractor because it provides text and layout metadata for ordinary PDFs. Tesseract is a page-level fallback for scanned pages and pages whose embedded text is sparse or damaged; this avoids OCR on pages with sufficient embedded text. Both extraction paths produce `_TextLine` records, so the existing deterministic hierarchy and hashing pipeline remains shared. Numbering is preferred because it encodes structure directly; typography is a useful fallback when numbering is absent.
 
-Validation is both automated and fixture-based. [test_parser.py](./test_parser.py) checks deterministic IDs, duplicate headings, parent/child consistency, malformed inputs, content hashes, numbering inference, serialization, title/hierarchy cleanup, table text, wrapped headings, paragraphs, and bullets. [test_versioning.py](./test_versioning.py) exercises real and synthetic PDF uploads, manual validation, storage, added/removed/modified/unchanged comparisons, whitespace normalization, and node-specific comparison. The tests also include a path-based comparison case where IDs change but normalized heading paths still match.
+Validation is both automated and fixture-based. [test_parser.py](./test_parser.py) checks deterministic IDs, duplicate headings, parent/child consistency, malformed inputs, content hashes, numbering inference, serialization, title/hierarchy cleanup, table text, wrapped headings, paragraphs, bullets, and OCR fallback behavior. OCR tests mock Tesseract's structured response and cover text-page bypass, sparse-page fallback, coordinate conversion, a missing executable, an engine error, and an empty OCR result; they do not require Tesseract to be installed. [test_versioning.py](./test_versioning.py) exercises real and synthetic PDF uploads, manual validation, storage, added/removed/modified/unchanged comparisons, whitespace normalization, node-specific comparison, and clear API reporting when OCR is unavailable.
 
-The parser does not include OCR. Scanned/image-only PDFs may yield an empty or incomplete tree. PyMuPDF replacement characters can occur when an embedded font has a broken character map. Tables are preserved as text rows, but column alignment, merged cells, and complex multi-column reading order are not guaranteed. Figures and diagrams are not extracted as visual content; captions may attach imperfectly. The parser is document-heuristic, not a general PDF layout engine.
+OCR fallback requires the Python packages `pytesseract` and Pillow plus an external Tesseract executable. On Windows, set `TESSERACT_CMD` to the installed executable when it is not available on `PATH`; a common location is `C:\Program Files\Tesseract-OCR\tesseract.exe`:
+
+```powershell
+$env:TESSERACT_CMD = "C:\Program Files\Tesseract-OCR\tesseract.exe"
+python -m uvicorn app:app --reload
+```
+
+OCR words and boxes are approximate, and grouping by Tesseract line IDs does not restore complete layout semantics. Recognition may vary with Tesseract versions and can distort reading order. Scanned tables are treated as approximate text lines; column alignment, merged cells, and complex multi-column reading order are not guaranteed. Figures and diagrams are not interpreted as visual content, and captions may attach imperfectly. The parser is document-heuristic, not a general PDF layout engine.
 
 ## 4. Version matching and change detection
 
@@ -106,7 +115,7 @@ The assignment materials available in this repository specify PDF hierarchy reco
 
 ## 9. Improvements with more time
 
-- Add OCR as an explicit fallback for scanned pages, with confidence and page-level provenance.
+- Add OCR confidence thresholds, page-level extraction provenance, and a review path for low-confidence OCR results.
 - Add stronger layout handling for multi-column text, merged/irregular tables, figures, captions, and reading order.
 - Create golden extraction fixtures from both supplied manual PDFs and compare expected headings, paths, tables, and body fragments—not only structural invariants.
 - Add parser confidence signals and a human review workflow for low-confidence sections.
@@ -124,8 +133,8 @@ The largest silent risks are incorrect reading order in multi-column PDFs, misse
 
 ### Where did I choose simplicity over correctness, and what would break first in production?
 
-I chose a deterministic PyMuPDF-plus-heuristics parser, pipe-text tables, flat JSON trees, and lexical source checks instead of a full layout model, OCR pipeline, semantic entailment system, or normalized case database. Production would first struggle with scanned PDFs and complex layouts, then with false confidence in generated cases and ambiguous version matches. Operational concerns such as authentication, upload limits, rate limiting, and concurrent workload handling are also intentionally outside this prototype.
+I chose a deterministic PyMuPDF-plus-heuristics parser with a page-level Tesseract fallback, pipe-text tables, flat JSON trees, and lexical source checks instead of a full layout model, semantic entailment system, or normalized case database. Production would first struggle with OCR errors, complex layouts, false confidence in generated cases, and ambiguous version matches. Operational concerns such as authentication, upload limits, rate limiting, and concurrent workload handling are also intentionally outside this prototype.
 
 ### What input is unsupported, and how does the system respond?
 
-Unsupported or unreliable inputs include non-PDF/invalid PDFs, empty PDFs, scanned PDFs without an OCR path, PDFs with badly broken embedded font maps, unrelated documents, assignment prompts that merely mention CT-200, and complex layouts whose reading order cannot be recovered by the implemented heuristics. Invalid PDFs produce a 400-style upload error; valid but non-CT-200 documents produce HTTP 422 and are not stored as manual versions; scanned or difficult PDFs may produce an incomplete tree rather than a reliable rejection. Provider output that is malformed, ungrounded, prohibited, or outside the schema is retried once and then rejected without persistence.
+Unsupported or unreliable inputs include non-PDF/invalid PDFs, empty PDFs, scanned PDFs when Tesseract is unavailable or fails, PDFs with badly broken embedded font maps that OCR cannot recover, unrelated documents, assignment prompts that merely mention CT-200, and complex layouts whose reading order cannot be recovered by the implemented heuristics. Invalid PDFs produce a 400-style upload error; valid but non-CT-200 documents produce HTTP 422 and are not stored as manual versions; OCR failures produce HTTP 503 with a readable reason, while imperfect OCR may still produce a nonempty tree requiring review. Provider output that is malformed, ungrounded, prohibited, or outside the schema is retried once and then rejected without persistence.

@@ -10,7 +10,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as api
-from parser import TreeNode
+import parser as parser_module
+from parser import OCRProcessingError, TreeNode, _TextLine
 from version_store import compare_trees
 
 
@@ -87,6 +88,48 @@ def test_upload_stores_pdf_tree_and_metadata(client, tmp_path):
     assert (storage / "versions.sqlite3").exists()
     assert (storage / "uploads" / f"{version['id']}.pdf").read_bytes() == content
     assert (storage / "trees" / f"{version['id']}.json").exists()
+
+
+def test_upload_reports_ocr_failure_without_saving_the_pdf(client, tmp_path, monkeypatch):
+    def fail_ocr(pdf_path):
+        raise OCRProcessingError("Tesseract OCR executable was not found; set TESSERACT_CMD.")
+
+    monkeypatch.setattr(api, "parse_pdf", fail_ocr)
+    response = client.post(
+        "/versions/upload?filename=scanned.pdf",
+        content=make_pdf([("1 Overview", "This is a CT-200 manual section.")]),
+        headers={"content-type": "application/pdf"},
+    )
+
+    assert response.status_code == 503
+    assert "TESSERACT_CMD" in response.json()["detail"]
+    assert not list((tmp_path / "version_storage" / "uploads").glob("*.pdf"))
+
+
+def test_scanned_manual_identity_is_checked_after_mocked_ocr(client, monkeypatch):
+    document = fitz.open()
+    page = document.new_page()
+    page.draw_rect(fitz.Rect(30, 30, 100, 100))
+    content = document.tobytes()
+    document.close()
+    ocr_lines = [
+        _TextLine("CardioTrack CT-200 Home Blood Pressure Monitor", 18, 0, (40, 40, 300, 60), 0),
+        _TextLine("1 Device Overview", 14, 0, (40, 90, 220, 108), 0),
+        _TextLine("This is the overview section for blood pressure.", 12, 0, (40, 120, 270, 135), 0),
+        _TextLine("1.1 Intended Use", 14, 0, (40, 155, 220, 173), 0),
+        _TextLine("This manual describes intended use of the monitor.", 12, 0, (40, 185, 280, 200), 0),
+    ]
+    monkeypatch.setattr(parser_module, "_ocr_page_lines", lambda page, page_number: ocr_lines)
+
+    response = client.post(
+        "/versions/upload?filename=scanned-manual.pdf",
+        content=content,
+        headers={"content-type": "application/pdf"},
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["is_ct200_manual"] is True
+    assert response.json()["node_count"] >= 3
 
 
 def test_list_versions_returns_all_versions(client):

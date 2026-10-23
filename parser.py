@@ -16,19 +16,30 @@ Known limitations (will be documented in README and approach doc):
 - If two sibling sections share the exact same heading text, they still get unique
   IDs because we include an occurrence counter in the ID seed.
 - PDFs with broken embedded font maps can still contain replacement characters;
-  OCR is not currently bundled with this prototype.
+  low-text pages use a Tesseract OCR fallback, whose layout and wording remain
+  approximate.
 """
 
 from __future__ import annotations
 
 import hashlib
+from io import BytesIO
 import json
+import os
 import re
+import shutil
+import threading
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
 import fitz  # PyMuPDF
+
+
+# Serialize temporary pytesseract command configuration during OCR calls.
+_TESSERACT_LOCK = threading.Lock()
+_OCR_MIN_ALPHANUMERIC_CHARS = 40
+_OCR_RENDER_SCALE = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +72,10 @@ class _TextLine:
     bbox: tuple[float, float, float, float]
     page_number: int
     kind: str = "text"
+
+
+class OCRProcessingError(RuntimeError):
+    """Raised when OCR is required but cannot produce usable page text."""
 
 
 def _make_id(heading: str, parent_id: Optional[str], occurrence: int) -> str:
@@ -181,6 +196,142 @@ def _extract_lines(page: fitz.Page, page_number: int) -> list[_TextLine]:
             )
         ]
     return sorted(result, key=lambda line: (round(line.bbox[1], 1), round(line.bbox[0], 1)))
+
+
+def _has_sufficient_page_text(lines: list[_TextLine]) -> bool:
+    """Whether embedded text is substantial enough to prefer over OCR."""
+    text = " ".join(line.text for line in lines)
+    if "\ufffd" in text:
+        return False
+    return sum(character.isalnum() for character in text) >= _OCR_MIN_ALPHANUMERIC_CHARS
+
+
+def _page_has_content(page: fitz.Page, lines: list[_TextLine]) -> bool:
+    """Avoid invoking OCR on genuinely blank pages."""
+    return bool(
+        any(line.text.strip() for line in lines)
+        or page.get_images(full=True)
+        or page.get_drawings()
+    )
+
+
+def _should_ocr_page(page: fitz.Page, lines: list[_TextLine]) -> bool:
+    """Use OCR only when a nonblank page has little or damaged embedded text."""
+    return not _has_sufficient_page_text(lines) and _page_has_content(page, lines)
+
+
+def _resolve_tesseract_executable() -> str:
+    """Resolve Tesseract from TESSERACT_CMD or PATH without invoking a shell."""
+    configured = os.environ.get("TESSERACT_CMD", "").strip()
+    candidate = configured or "tesseract"
+    candidate_path = Path(candidate)
+    if candidate_path.is_file():
+        return str(candidate_path)
+    executable = shutil.which(candidate)
+    if executable:
+        return executable
+    raise OCRProcessingError(
+        "Tesseract OCR executable was not found. Install Tesseract and either "
+        "add it to PATH or set TESSERACT_CMD to its executable path."
+    )
+
+
+def _ocr_page_lines(page: fitz.Page, page_number: int) -> list[_TextLine]:
+    """Render a page and group Tesseract word boxes into parser text lines."""
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError as exc:
+        raise OCRProcessingError(
+            "OCR fallback requires pytesseract and Pillow; install requirements.txt."
+        ) from exc
+
+    executable = _resolve_tesseract_executable()
+    try:
+        pixmap = page.get_pixmap(
+            matrix=fitz.Matrix(_OCR_RENDER_SCALE, _OCR_RENDER_SCALE),
+            alpha=False,
+        )
+    except Exception as exc:
+        raise OCRProcessingError(f"Could not render page {page_number + 1} for OCR: {exc}") from exc
+    scale_x = float(page.rect.width) / pixmap.width
+    scale_y = float(page.rect.height) / pixmap.height
+
+    try:
+        with Image.open(BytesIO(pixmap.tobytes("png"))) as image:
+            with _TESSERACT_LOCK:
+                previous_command = pytesseract.pytesseract.tesseract_cmd
+                pytesseract.pytesseract.tesseract_cmd = executable
+                try:
+                    data = pytesseract.image_to_data(
+                        image,
+                        output_type=pytesseract.Output.DICT,
+                        config="--psm 6",
+                    )
+                finally:
+                    pytesseract.pytesseract.tesseract_cmd = previous_command
+    except pytesseract.TesseractNotFoundError as exc:
+        raise OCRProcessingError(
+            "Tesseract OCR executable could not be started. Check TESSERACT_CMD "
+            "or install Tesseract on PATH."
+        ) from exc
+    except Exception as exc:
+        raise OCRProcessingError(
+            f"Tesseract OCR failed on page {page_number + 1}: {exc}"
+        ) from exc
+
+    required_fields = (
+        "text", "left", "top", "width", "height", "block_num", "par_num", "line_num",
+    )
+    if not isinstance(data, dict) or any(field not in data for field in required_fields):
+        raise OCRProcessingError(f"Tesseract returned malformed OCR data for page {page_number + 1}.")
+    word_count = len(data["text"])
+    if any(len(data[field]) != word_count for field in required_fields):
+        raise OCRProcessingError(f"Tesseract returned incomplete OCR data for page {page_number + 1}.")
+
+    grouped: dict[tuple[int, int, int], list[tuple[int, str, int, int, int, int]]] = {}
+    try:
+        for index, raw_text in enumerate(data["text"]):
+            text = str(raw_text).strip()
+            if not text:
+                continue
+            key = tuple(
+                int(data[field][index])
+                for field in ("block_num", "par_num", "line_num")
+            )
+            left = int(data["left"][index])
+            top = int(data["top"][index])
+            width = int(data["width"][index])
+            height = int(data["height"][index])
+            grouped.setdefault(key, []).append((left, text, top, width, height, left + width))
+    except (TypeError, ValueError, IndexError) as exc:
+        raise OCRProcessingError(
+            f"Tesseract returned invalid OCR coordinates for page {page_number + 1}."
+        ) from exc
+
+    lines: list[_TextLine] = []
+    for words in grouped.values():
+        words.sort(key=lambda word: word[0])
+        left = min(word[0] for word in words)
+        top = min(word[2] for word in words)
+        right = max(word[5] for word in words)
+        bottom = max(word[2] + word[4] for word in words)
+        bbox = (
+            page.rect.x0 + left * scale_x,
+            page.rect.y0 + top * scale_y,
+            page.rect.x0 + right * scale_x,
+            page.rect.y0 + bottom * scale_y,
+        )
+        lines.append(
+            _TextLine(
+                text=" ".join(word[1] for word in words),
+                size=max(1.0, (bottom - top) * scale_y * 0.8),
+                flags=0,
+                bbox=bbox,
+                page_number=page_number,
+            )
+        )
+    return sorted(lines, key=lambda line: (round(line.bbox[1], 1), round(line.bbox[0], 1)))
 
 
 _ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
@@ -499,7 +650,15 @@ def parse_pdf(pdf_path: str | Path) -> list[TreeNode]:
         page_heights = {index: float(page.rect.height) for index, page in enumerate(doc)}
         lines: list[_TextLine] = []
         for page_number, page in enumerate(doc):
-            lines.extend(_extract_lines(page, page_number))
+            page_lines = _extract_lines(page, page_number)
+            if _should_ocr_page(page, page_lines):
+                page_lines = _ocr_page_lines(page, page_number)
+                if not page_lines:
+                    raise OCRProcessingError(
+                        f"Tesseract OCR returned no text for page {page_number + 1}; "
+                        "refusing to silently produce an incomplete document tree."
+                    )
+            lines.extend(page_lines)
         lines = _filter_page_furniture(lines, page_heights)
 
         text_lines = [line for line in lines if line.kind == "text"]

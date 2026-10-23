@@ -4,7 +4,7 @@
 
 This FastAPI prototype parses CardioTrack CT-200 blood pressure monitor manuals into section trees. Part 1 provides health, tree, and search endpoints. Part 2 stores each uploaded PDF and parsed tree as a separate version, then compares sections between versions. Part 3 adds named selections pinned to a manual version, immutable source snapshots, generation provenance storage, and selection/generation staleness checks.
 
-The parser combines spans into visual lines, joins wrapped headings, preserves paragraph and list boundaries, writes detected tables as row-oriented text, and uses section numbering with typography as a fallback for hierarchy. Uploads are checked for CT-200 product details and the distinctive `Device Overview` and `Intended Use` sections. PDFs that appear to be assignment prompts or unrelated documents are rejected with `422` and are not stored as manual versions.
+The parser combines spans into visual lines, joins wrapped headings, preserves paragraph and list boundaries, writes detected tables as row-oriented text, and uses section numbering with typography as a fallback for hierarchy. Pages with little or damaged embedded text use a Tesseract OCR fallback; pages with sufficient embedded text do not invoke OCR. Uploads are checked for CT-200 product details and the distinctive `Device Overview` and `Intended Use` sections. PDFs that appear to be assignment prompts or unrelated documents are rejected with `422` and are not stored as manual versions.
 
 Version metadata is stored in SQLite. Uploaded PDFs and parsed JSON trees are stored under `storage/uploads/` and `storage/trees/`. By default, the storage directory is `storage/` in the project folder. Set `CT200_STORAGE_DIR` before starting the server to choose another location. Existing Part 1 data remains in `output/ct200_tree.json`.
 
@@ -31,6 +31,19 @@ Run the automated tests:
 ```powershell
 python -m pytest -q
 ```
+
+## OCR setup and behavior
+
+The Python OCR dependencies (`pytesseract` and Pillow) are installed by `requirements.txt`. Tesseract itself is a separate executable and must also be installed. On Windows, install Tesseract OCR and set `TESSERACT_CMD` in the PowerShell session before starting the API if its executable is not on `PATH`:
+
+```powershell
+$env:TESSERACT_CMD = "C:\Program Files\Tesseract-OCR\tesseract.exe"
+python -m uvicorn app:app --reload
+```
+
+The path above is the common Windows installation location; use the actual executable path on your machine. If `tesseract` is available on `PATH`, `TESSERACT_CMD` can be omitted. The parser checks each page and invokes OCR when it has fewer than 40 alphanumeric embedded-text characters or contains a replacement character, provided the page has text, images, or drawings. Truly blank pages are skipped. OCR output is grouped into approximate visual lines with page-relative bounding boxes and then passed through the same hierarchy, cleanup, and hashing pipeline as embedded text. If OCR is needed but Tesseract is missing, fails, or returns no text for that page, parsing raises a clear error instead of silently accepting an empty result; the upload API reports this as `503` and removes the incomplete upload.
+
+OCR recognition and geometry are approximate. It may misread characters, merge or split lines, and cannot reliably recover columns or table relationships; scanned tables become OCR text rather than guaranteed structured rows. Figures and diagrams remain visual content and are not interpreted. The parser tests mock Tesseract responses, so automated tests do not require a working Tesseract installation.
 
 ## API endpoints
 
@@ -269,9 +282,9 @@ Added and removed sections include the available old or new ID, content hash, an
 
 ## Current limitations
 
-- Section recognition still uses numbering and font-size heuristics; unusual or scanned PDFs may need OCR or document-specific rules.
+- Section recognition still uses numbering and font-size heuristics; OCR line heights are approximate and unusual documents may need document-specific rules.
 - Tables are preserved as text rows, but complex multi-column layouts may still be read in the wrong order. Images and diagrams are not extracted as visual content.
-- Some embedded PDF fonts have broken character maps and PyMuPDF may return replacement characters for glyphs that are visually present. OCR is not bundled in this prototype.
+- OCR can recover text from many scanned or damaged-text pages, but its recognition and line geometry can be inaccurate and may vary with Tesseract versions; complex tables, columns, figures, and diagrams are not reliably reconstructed.
 - Interface cleanup removes known browser warnings, menu labels, tab labels, and repeated edge text. It does not try to guess whether every arbitrary line is interface chrome.
 - A changed heading or changed ancestor heading can change parser IDs and the normalized heading path. Such a section may appear as a removal and an addition instead of a rename or modification.
 - Duplicate sections with the same heading are matched by sibling order, so inserting a duplicate earlier in the tree can shift matches.

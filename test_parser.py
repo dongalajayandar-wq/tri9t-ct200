@@ -13,8 +13,10 @@ Covers:
 import hashlib
 import fitz
 import pytest
+import parser as parser_module
 from parser import (
     TreeNode,
+    _TextLine,
     _make_id,
     _infer_level_from_numbering,
     parse_pdf,
@@ -80,8 +82,9 @@ class TestParentChildRelationships:
     """If we can parse the real PDF, verify the tree is internally consistent."""
 
     @pytest.fixture
-    def real_tree(self):
-        """Try to load the real PDF.  Skip if not available."""
+    def real_tree(self, monkeypatch):
+        """Parse extractable fixture text without requiring system Tesseract."""
+        monkeypatch.setattr(parser_module, "_should_ocr_page", lambda page, lines: False)
         candidates = [
             Path("data/ct200_manual.pdf"),
             Path("data/ct200_manual_v1.pdf"),
@@ -231,10 +234,11 @@ class TestSerialization:
 
 
 class TestImprovedExtraction:
-    def test_available_ct200_manual_has_clean_title_hierarchy_and_table(self):
+    def test_available_ct200_manual_has_clean_title_hierarchy_and_table(self, monkeypatch):
         manual = Path("data/ct200_manual.pdf")
         if not manual.exists():
             pytest.skip("CT-200 manual is not available in data/")
+        monkeypatch.setattr(parser_module, "_should_ocr_page", lambda page, lines: False)
         nodes = parse_pdf(manual)
         root = nodes[0]
         headings = [node.heading for node in nodes]
@@ -373,3 +377,110 @@ class TestImprovedExtraction:
         )
         assert is_ct200_manual(manual_text)
         assert not is_ct200_manual(assignment_text)
+
+
+class TestOCRFallback:
+    def test_sufficient_embedded_text_does_not_invoke_ocr(self, tmp_path, monkeypatch):
+        def draw(page):
+            page.insert_text(
+                (40, 80),
+                "This ordinary text page already contains enough extractable content.",
+                fontsize=11,
+            )
+
+        def unexpected_ocr(*args, **kwargs):
+            pytest.fail("OCR should not run for a page with sufficient embedded text")
+
+        monkeypatch.setattr(parser_module, "_ocr_page_lines", unexpected_ocr)
+        nodes = parse_pdf(_make_pdf(tmp_path, draw))
+        assert "ordinary text page" in nodes[0].body
+
+    def test_insufficient_text_uses_ocr_lines_in_existing_tree_pipeline(self, tmp_path, monkeypatch):
+        def draw(page):
+            page.insert_text((40, 80), "weak", fontsize=11)
+
+        observed = []
+
+        def fake_ocr(page, page_number):
+            observed.append(page_number)
+            return [
+                _TextLine("1. OCR Section", 18, 0, (40, 40, 180, 60), page_number),
+                _TextLine("Recognized body text from the scanned page", 11, 0, (40, 85, 260, 100), page_number),
+                _TextLine("A second line keeps the body font classification stable", 11, 0, (40, 105, 280, 120), page_number),
+            ]
+
+        monkeypatch.setattr(parser_module, "_ocr_page_lines", fake_ocr)
+        nodes = parse_pdf(_make_pdf(tmp_path, draw))
+        section = next(node for node in nodes if node.heading == "1. OCR Section")
+
+        assert observed == [0]
+        assert "Recognized body text" in section.body
+        assert "weak" not in " ".join(node.heading + " " + node.body for node in nodes)
+        assert all(node.content_hash == hashlib.sha256(node.body.encode("utf-8")).hexdigest() for node in nodes)
+
+    def test_ocr_words_become_page_numbered_text_lines_with_scaled_boxes(self, monkeypatch):
+        import pytesseract
+
+        data = {
+            "text": ["CT-200", "Manual", "Section"],
+            "left": [20, 80, 20],
+            "top": [30, 30, 60],
+            "width": [40, 50, 70],
+            "height": [20, 20, 20],
+            "block_num": [1, 1, 1],
+            "par_num": [1, 1, 1],
+            "line_num": [1, 1, 2],
+        }
+        monkeypatch.setenv("TESSERACT_CMD", "mock-tesseract")
+        monkeypatch.setattr(parser_module.shutil, "which", lambda command: "mock-tesseract.exe")
+        monkeypatch.setattr(pytesseract, "image_to_data", lambda image, **kwargs: data)
+
+        document = fitz.open()
+        try:
+            page = document.new_page(width=200, height=300)
+            lines = parser_module._ocr_page_lines(page, 4)
+        finally:
+            document.close()
+
+        assert [line.text for line in lines] == ["CT-200 Manual", "Section"]
+        assert all(isinstance(line, _TextLine) and line.page_number == 4 for line in lines)
+        assert lines[0].bbox == pytest.approx((10, 15, 65, 25))
+        assert lines[0].size == pytest.approx(8)
+
+    def test_missing_tesseract_raises_clear_error(self, tmp_path, monkeypatch):
+        def draw(page):
+            page.insert_text((40, 80), "short", fontsize=11)
+
+        monkeypatch.setenv("TESSERACT_CMD", str(tmp_path / "missing-tesseract.exe"))
+        monkeypatch.setattr(parser_module.shutil, "which", lambda command: None)
+
+        with pytest.raises(RuntimeError, match="Tesseract OCR executable was not found.*TESSERACT_CMD"):
+            parse_pdf(_make_pdf(tmp_path, draw))
+
+    def test_tesseract_runtime_error_is_reported_with_page_number(self, tmp_path, monkeypatch):
+        import pytesseract
+
+        def draw(page):
+            page.insert_text((40, 80), "short", fontsize=11)
+
+        monkeypatch.setenv("TESSERACT_CMD", "mock-tesseract")
+        monkeypatch.setattr(
+            parser_module.shutil,
+            "which",
+            lambda command: str(tmp_path / "mock-tesseract.exe"),
+        )
+
+        def fail_ocr(*args, **kwargs):
+            raise RuntimeError("mocked engine failure")
+
+        monkeypatch.setattr(pytesseract, "image_to_data", fail_ocr)
+        with pytest.raises(RuntimeError, match="Tesseract OCR failed on page 1: mocked engine failure"):
+            parse_pdf(_make_pdf(tmp_path, draw))
+
+    def test_empty_ocr_result_does_not_silently_return_a_tree(self, tmp_path, monkeypatch):
+        def draw(page):
+            page.insert_text((40, 80), "short", fontsize=11)
+
+        monkeypatch.setattr(parser_module, "_ocr_page_lines", lambda page, page_number: [])
+        with pytest.raises(RuntimeError, match="Tesseract OCR returned no text for page 1"):
+            parse_pdf(_make_pdf(tmp_path, draw))

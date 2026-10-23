@@ -559,7 +559,14 @@ def generate_qa_cases(
                         "content": (
                             "Correct your prior response. It failed these checks:\n"
                             f"{issues}\nReturn only corrected JSON with 3 to 5 cases and "
-                            "exactly the required fields. Use only the same cited source excerpts."
+                            "exactly the required fields. Use only the same cited source excerpts. "
+                            "Never perform, simulate, or direct an action prohibited by the source. "
+                            "For a prohibition, create a documentation or compliance-verification "
+                            "case instead: steps must verify that the prohibition is documented, "
+                            "not carry out the prohibited action. Expected results must state the "
+                            "prohibition itself and must not invent what would happen if someone "
+                            "violated it. Preserve the source wording and do not invent unsupported "
+                            "device behavior."
                         ),
                     },
                 ]

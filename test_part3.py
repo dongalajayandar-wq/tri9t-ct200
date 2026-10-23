@@ -148,6 +148,42 @@ def safe_cleaning_cases():
     }
 
 
+def safe_cleaning_compliance_cases():
+    node_id = "cleaning-node"
+    return {
+        "cases": [
+            {
+                "title": "Do Not Submerge the Device or Cuff",
+                "requirement": "Do not submerge the device or cuff.",
+                "preconditions": [],
+                "steps": ["Verify: Do not submerge the device or cuff."],
+                "expected_result": "Do not submerge the device or cuff.",
+                "source_node_ids": [node_id],
+            },
+            {
+                "title": "Do Not Use Alcohol, Solvents, or Abrasive Cleaners",
+                "requirement": "Do not use alcohol, solvents, or abrasive cleaners.",
+                "preconditions": [],
+                "steps": [
+                    "Verify: Do not use alcohol, solvents, or abrasive cleaners."
+                ],
+                "expected_result": "Do not use alcohol, solvents, or abrasive cleaners.",
+                "source_node_ids": [node_id],
+            },
+            {
+                "title": "Wipe the Device Body and Cuff Exterior",
+                "requirement": "Wipe the device body and cuff exterior with a soft, dry cloth.",
+                "preconditions": [],
+                "steps": [
+                    "Verify: Wipe the device body and cuff exterior with a soft, dry cloth."
+                ],
+                "expected_result": "Wipe the device body and cuff exterior with a soft, dry cloth.",
+                "source_node_ids": [node_id],
+            },
+        ]
+    }
+
+
 def groq_submersion_case():
     return {
         "title": "Verify Submersion Not Allowed",
@@ -542,7 +578,7 @@ def test_case_cannot_negate_an_affirmative_source_result():
 def test_unsafe_mocked_completion_retries_once_and_reports_attempt_count():
     replies = [
         (json.dumps({"cases": [groq_submersion_case(), *safe_cleaning_cases()["cases"][:2]]}), "mock"),
-        (json.dumps(safe_cleaning_cases()), "mock"),
+        (json.dumps(safe_cleaning_compliance_cases()), "mock"),
     ]
     calls = []
 
@@ -558,8 +594,44 @@ def test_unsafe_mocked_completion_retries_once_and_reports_attempt_count():
 
     assert len(calls) == 2
     assert "explicitly prohibited" in calls[1][-1]["content"]
+    assert "Never perform, simulate, or direct an action prohibited by the source." in calls[1][-1]["content"]
+    assert "documentation or compliance-verification case" in calls[1][-1]["content"]
+    assert "steps must verify that the prohibition is documented" in calls[1][-1]["content"]
+    assert "must not invent what would happen if someone violated it" in calls[1][-1]["content"]
     assert generated["completion_attempts"] == 2
-    assert generated["cases"] == safe_cleaning_cases()["cases"]
+    assert generated["cases"] == safe_cleaning_compliance_cases()["cases"]
+
+
+def test_safe_compliance_correction_is_persisted_after_unsafe_first_response(
+    storage, monkeypatch
+):
+    source = cleaning_source_snapshot()[0]
+    add_version(
+        storage,
+        "v1",
+        [("cleaning-node", source["heading"], source["body"])],
+        "2026-10-23T10:00:00+00:00",
+    )
+    selection = create_selection(node_ids=["cleaning-node"])
+    replies = iter(
+        [
+            (json.dumps({"cases": [groq_alcohol_case(), *safe_cleaning_cases()["cases"][:2]]}), "mock"),
+            (json.dumps(safe_cleaning_compliance_cases()), "mock"),
+        ]
+    )
+    calls = []
+
+    def mocked_provider(messages, model):
+        calls.append(messages)
+        return next(replies)
+
+    monkeypatch.setattr(generation, "request_groq_completion", mocked_provider)
+    saved = api.post_selection_generation(selection["id"])
+
+    assert len(calls) == 2
+    assert saved["cases"] == safe_cleaning_compliance_cases()["cases"]
+    assert saved["completion_attempts"] == 2
+    assert api.get_selection_generations(selection["id"])["count"] == 1
 
 
 def test_two_semantically_invalid_mocked_completions_fail_with_visible_attempt_count(
